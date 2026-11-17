@@ -1,0 +1,14 @@
+{
+    "name": "ktulchu/yii2-app-log-example",
+    "description": "Independent console Yii2 application exercising the audit package",
+    "license": "MIT",
+    "repositories": {
+        "package": {"type": "vcs", "url": "https://github.com/Ktulchu/yii2-app-log"}
+    },
+    "require": {
+        "ktulchu/yii2-app-log": "dev-main",
+        "yidas/yii2-composer-bower-skip": "^2.0"
+    },
+    "config": {"allow-plugins": {"yiisoft/yii2-composer": true}},
+    "autoload": {"psr-4": {"Example\\": "src/"}}
+}

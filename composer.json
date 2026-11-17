@@ -1,0 +1,32 @@
+{
+    "name": "ktulchu/yii2-app-log",
+    "description": "Transactional PostgreSQL audit history for Yii2 ActiveRecord, including lossless JSON and JSONB",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "ext-pdo": "*",
+        "ext-pdo_pgsql": "*",
+        "ext-json": "*",
+        "yiisoft/yii2": "^2.0.53"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5",
+        "phpstan/phpstan": "^2.1",
+        "yidas/yii2-composer-bower-skip": "^2.0"
+    },
+    "autoload": {
+        "psr-4": {"Ktulchu\\Yii2AppLog\\": "src/"}
+    },
+    "autoload-dev": {
+        "psr-4": {"Ktulchu\\Yii2AppLog\\Tests\\": "tests/"}
+    },
+    "config": {"allow-plugins": {"yiisoft/yii2-composer": true}, "sort-packages": true},
+    "archive": {
+        "exclude": ["/vendor", "/.phpstan", "/.phpunit.cache", "/composer.lock", "/fixtures/basic/vendor", "/fixtures/basic/runtime", "/fixtures/basic/composer.lock"]
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse --memory-limit=512M"
+    }
+}

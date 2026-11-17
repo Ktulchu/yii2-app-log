@@ -1,0 +1,52 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.3', '8.4']
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: audit
+          POSTGRES_PASSWORD: audit
+          POSTGRES_DB: yii2_audit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U audit -d yii2_audit"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APPLOG_TEST_DSN: 'pgsql:host=127.0.0.1;port=5432;dbname=yii2_audit'
+      APPLOG_TEST_USER: audit
+      APPLOG_TEST_PASSWORD: audit
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_pgsql, mbstring, dom
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist
+      - run: composer validate --strict
+      - run: composer audit
+      - run: composer test
+      - run: composer analyse
+      - name: Independent Composer installation and migrations
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit-package" "$RUNNER_TEMP/audit-example"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/audit-package"
+          cp -R fixtures/basic/. "$RUNNER_TEMP/audit-example"
+          cd "$RUNNER_TEMP/audit-example"
+          composer config repositories.package '{"type":"path","url":"../audit-package","options":{"symlink":false,"versions":{"ktulchu/yii2-app-log":"dev-main"}}}'
+          composer install --no-interaction --prefer-dist
+          php yii migrate --interactive=0
+          php yii smoke

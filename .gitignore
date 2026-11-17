@@ -1,0 +1,7 @@
+/vendor/
+/composer.lock
+/.phpunit.cache/
+/fixtures/basic/vendor/
+/fixtures/basic/composer.lock
+/fixtures/basic/runtime/
+/.phpstan/

@@ -1,0 +1,23 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+require __DIR__ . '/vendor/autoload.php';
+require __DIR__ . '/vendor/yiisoft/yii2/Yii.php';
+exit((new yii\console\Application([
+    'id' => 'independent-audit-example',
+    'basePath' => __DIR__,
+    'controllerNamespace' => 'Example',
+    'components' => ['db' => [
+        'class' => yii\db\Connection::class,
+        'dsn' => getenv('APPLOG_TEST_DSN') ?: 'pgsql:host=127.0.0.1;dbname=yii2_audit_example',
+        'username' => getenv('APPLOG_TEST_USER') ?: 'audit',
+        'password' => getenv('APPLOG_TEST_PASSWORD') ?: 'audit',
+    ]],
+    'controllerMap' => ['migrate' => [
+        'class' => yii\console\controllers\MigrateController::class,
+        'migrationPath' => [
+            '@vendor/ktulchu/yii2-app-log/migrations',
+            '@app/migrations',
+        ],
+    ]],
+]))->run());
