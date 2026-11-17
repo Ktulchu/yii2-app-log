@@ -48,5 +48,7 @@ jobs:
           cd "$RUNNER_TEMP/audit-example"
           composer config repositories.package '{"type":"path","url":"../audit-package","options":{"symlink":false,"versions":{"ktulchu/yii2-app-log":"dev-main"}}}'
           composer install --no-interaction --prefer-dist
+          php -r '$db = new PDO(getenv("APPLOG_TEST_DSN"), getenv("APPLOG_TEST_USER"), getenv("APPLOG_TEST_PASSWORD")); $db->exec("CREATE DATABASE yii2_example");'
+          export APPLOG_TEST_DSN='pgsql:host=127.0.0.1;port=5432;dbname=yii2_example'
           php yii migrate --interactive=0
           php yii smoke
