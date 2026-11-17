@@ -2,6 +2,10 @@
 
 PostgreSQL audit history for selected Yii2 ActiveRecord models. PHP 8.1+, Yii 2.0.53+ (2.0.x), PDO PostgreSQL. MIT.
 
+## Project background
+
+The underlying audit behavior was developed and used in a private commercial Yii2 application over several years. This public repository began when that experience was extracted, generalized, and hardened into an independent Composer package. The original development history remains in a private commercial GitLab repository; the public GitHub history covers the standalone package, not the full lifetime of the original solution. The standalone releases have their own tests and release history.
+
 ## Install
 
 The package is distributed through GitHub VCS; it is not published on Packagist.
