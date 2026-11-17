@@ -40,9 +40,11 @@ final class AuditTest extends TestCase
         $this->db->createCommand('DROP TABLE IF EXISTS fixture, app_log, department CASCADE')->execute();
         $this->db->createCommand('DROP SEQUENCE IF EXISTS write_probe CASCADE')->execute();
         require_once dirname(__DIR__) . '/migrations/m261117_000001_create_app_log.php';
+        require_once dirname(__DIR__) . '/migrations/m261117_000003_add_app_log_context.php';
         ob_start();
         try {
             self::assertNotFalse((new \m261117_000001_create_app_log(['db' => $this->db]))->up());
+            self::assertNotFalse((new \m261117_000003_add_app_log_context(['db' => $this->db]))->up());
         } finally {
             ob_end_clean();
         }
@@ -386,7 +388,7 @@ final class AuditTest extends TestCase
             $this->atomic(fn () => $this->record()->save(false));
             self::fail('Unsupported legacy options must not be silently ignored.');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('options', $e->getMessage());
+            self::assertStringContainsString('JSON', $e->getMessage());
         }
         self::assertCount(0, $this->rows());
     }
@@ -642,6 +644,7 @@ final class AuditTest extends TestCase
         ob_start();
         try {
             self::assertNotFalse((new \m261117_000001_create_app_log(['db' => $this->db]))->up());
+            self::assertNotFalse((new \m261117_000003_add_app_log_context(['db' => $this->db]))->up());
         } finally { ob_end_clean(); }
         $this->db->createCommand('CREATE TABLE pref_pair (tenant text, code integer, title text, PRIMARY KEY (tenant, code))')->execute();
         $r = new PairFixture();

@@ -21,9 +21,13 @@ final class SmokeController extends Controller
             if (!$note->save(false)) { throw new \RuntimeException('Update failed.'); }
             $note->refresh();
             $note->save(false);
+            $note->setAttribute('is_deleted', true);
+            if (!$note->save(false)) { throw new \RuntimeException('Soft delete failed.'); }
+            $note->setAttribute('is_deleted', false);
+            if (!$note->save(false)) { throw new \RuntimeException('Restore failed.'); }
             if ($note->delete() !== 1) { throw new \RuntimeException('Delete failed.'); }
             $rows = History::read($db, Note::class, $note->getPrimaryKey(true));
-            if (array_column($rows, 'operation') !== ['insert', 'update', 'delete']) {
+            if (array_column($rows, 'operation') !== ['insert', 'update', 'delete', 'update', 'delete']) {
                 throw new \RuntimeException('Incorrect CRUD audit history.');
             }
             if (array_keys(json_decode($rows[1]['new_values'], true)) !== ['title']) {
@@ -32,8 +36,15 @@ final class SmokeController extends Controller
             if (!str_contains($rows[0]['new_values'], '123456789012345678901234567890')) {
                 throw new \RuntimeException('Numeric precision was lost.');
             }
+            if (!$rows[2]['is_soft_delete'] || $rows[4]['is_soft_delete']
+                || array_column($rows, 'staff_id') !== [7, 7, 7, 7, 7]
+                || History::readLogical($db, 'ExampleDocument', ['id' => $note->getAttribute('id')]) !== $rows) {
+                throw new \RuntimeException('Actor, soft delete or logical identity failed.');
+            }
+            $document = json_decode($rows[0]['new_values'], true, 512, JSON_BIGINT_AS_STRING);
+            if (!isset($document['document']['changes'])) { throw new \RuntimeException('JSON presentation missing.'); }
             $transaction->commit();
-            $this->stdout("Independent Composer application: migration + CRUD + JSON/JSONB + no-op passed.\n");
+            $this->stdout("Independent Composer application: migration + CRUD + JSON/JSONB + presentation + actors + logical identity + soft delete passed.\n");
             return 0;
         } catch (\Throwable $e) {
             if ($transaction->isActive) { $transaction->rollBack(); }

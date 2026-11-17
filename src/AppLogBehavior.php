@@ -14,20 +14,28 @@ use yii\db\Transaction;
 /**
  * Attach only to selected models. Requires an application-owned transaction.
  * @phpstan-type Snapshot array<string, array{type: string, raw: ?string, json: string}>
+ * @phpstan-import-type Options from JsonChanges
  */
 final class AppLogBehavior extends Behavior
 {
     /** Column names, scalar callbacks, or label/value/preFilter options. Empty means all columns.
-     * @var array<int|string, string|callable|array{label?: string, value?: callable, preFilter?: callable}>
+     * @var array<int|string, string|callable|Options>
      */
     public array $attributes = [];
     /** @var list<string> */
     public array $except = [];
+    public ?int $actorContactId = null;
+    public ?int $actorStaffId = null;
+    /** @var callable(ActiveRecord): array{contact_id?: ?int, staff_id?: ?int}|null */
+    public $actorProvider = null;
+    public ?string $deletionMarkAttribute = null;
+    /** Null preserves the source's any-change classification. Set a scalar for targeted deletion. */
+    public mixed $deletionMarkValue = null;
     /** @var Snapshot */
     private array $before = [];
     /** @var list<string> */
     private array $fields = [];
-    /** @var array<string, array{label?: string, value?: callable, preFilter?: callable}> */
+    /** @var array<string, Options> */
     private array $fieldOptions = [];
     private ?Connection $connection = null;
     private ?Transaction $transaction = null;
@@ -110,6 +118,17 @@ final class AppLogBehavior extends Behavior
             if ($schema->primaryKey === []) {
                 throw new \LogicException('Audited models require a primary key.');
             }
+            if ($this->actorProvider !== null && !is_callable($this->actorProvider)) {
+                throw new \LogicException('actorProvider must be callable.');
+            }
+            if ($this->deletionMarkAttribute !== null
+                && (!isset($schema->columns[$this->deletionMarkAttribute])
+                    || in_array($schema->columns[$this->deletionMarkAttribute]->dbType, ['json', 'jsonb'], true))) {
+                throw new \LogicException('deletionMarkAttribute must name a scalar column.');
+            }
+            if ($this->deletionMarkValue !== null && !is_scalar($this->deletionMarkValue)) {
+                throw new \LogicException('deletionMarkValue must be scalar or null.');
+            }
             if (!array_is_list($this->except)) {
                 throw new \LogicException('except accepts a list of column names only.');
             }
@@ -125,8 +144,8 @@ final class AppLogBehavior extends Behavior
                     throw new \LogicException('Unknown audit column.');
                 }
                 $options = is_int($key) ? [] : (is_callable($configuration) ? ['value' => $configuration] : $configuration);
-                if (!is_array($options) || array_diff(array_keys($options), ['label', 'value', 'preFilter']) !== []) {
-                    throw new \LogicException('Audit options accept only label, value and preFilter.');
+                if (!is_array($options) || array_diff(array_keys($options), ['label', 'value', 'preFilter', 'type', 'model', 'only', 'except', 'functions']) !== []) {
+                    throw new \LogicException('Audit options contain unsupported keys.');
                 }
                 if (array_key_exists('label', $options) && !is_string($options['label'])) {
                     throw new \LogicException('Audit label must be a string.');
@@ -139,6 +158,7 @@ final class AppLogBehavior extends Behavior
                 if (isset($options['value']) && in_array($schema->columns[$name]->dbType, ['json', 'jsonb'], true)) {
                     throw new \LogicException('Value callbacks support scalar columns only; JSON is audited losslessly.');
                 }
+                JsonChanges::validate($options, $schema->columns[$name]->dbType);
                 $this->fieldOptions[$name] = $options;
             }
             $this->fields = array_values(array_diff(array_keys($this->fieldOptions), $this->except));
@@ -178,7 +198,17 @@ final class AppLogBehavior extends Behavior
             $old = $this->before;
             $key = $operation === 'delete' ? $this->key : $model->getPrimaryKey(true);
             $new = $operation === 'delete' ? [] : $this->snapshot($key, false);
-            if ($operation === 'update') {
+            $softDelete = false;
+            $marker = $this->deletionMarkAttribute;
+            if ($operation === 'update' && $marker !== null && $old[$marker]['raw'] !== $new[$marker]['raw']) {
+                $column = $model::getTableSchema()->columns[$marker];
+                $softDelete = $this->deletionMarkValue === null
+                    || $column->phpTypecast($new[$marker]['raw']) === $column->phpTypecast($this->deletionMarkValue);
+            }
+            if ($marker !== null && !in_array($marker, $this->fields, true)) {
+                unset($old[$marker], $new[$marker]);
+            }
+            if ($operation === 'update' && !$softDelete) {
                 foreach ($this->fields as $name) {
                     if (!$this->different($db, $name, $old[$name], $new[$name])) {
                         unset($old[$name], $new[$name]);
@@ -200,15 +230,39 @@ final class AppLogBehavior extends Behavior
             if ($old === [] && $new === []) {
                 return;
             }
+            $changes = [];
+            foreach (array_keys($old + $new) as $name) {
+                if (!isset($this->fieldOptions[$name]['type'])) { continue; }
+                $builder = new JsonChanges($db, $this->fieldOptions[$name] + ['label' => $model->getAttributeLabel($name)],
+                    ($old[$name] ?? $new[$name])['type'] === 'jsonb');
+                $changes[$name] = $builder->build($old[$name]['raw'] ?? null, $new[$name]['raw'] ?? null,
+                    isset($old[$name]), isset($new[$name]));
+            }
+            $oldDocument = $this->document($old, $operation === 'delete' ? $changes : []);
+            $newDocument = $this->document($new, $operation === 'delete' ? [] : $changes);
+            [$contactId, $staffId] = $this->actorIds();
+            $logicalType = $this->getUpdatedModelClass();
+            $logicalId = $this->getUpdatedModelId();
+            if (!is_array($logicalId)) { $logicalId = ['id' => $logicalId]; }
+            if ($logicalType === '' || $logicalId === []) { throw new \LogicException('Logical identity must not be empty.'); }
+            foreach ($logicalId as $id) {
+                if (!is_int($id) && !is_string($id)) { throw new \LogicException('Logical identifiers must be integers or strings.'); }
+            }
             $db->createCommand(
-                'INSERT INTO {{%app_log}} (entity_type, entity_id, operation, old_values, new_values)
-                 VALUES (:type, CAST(:key AS jsonb), :operation, CAST(:old AS json), CAST(:new AS json))',
+                'INSERT INTO {{%app_log}} (entity_type, entity_id, operation, old_values, new_values,
+                    contact_id, staff_id, logical_entity_type, logical_entity_id, is_soft_delete)
+                 VALUES (:type, CAST(:key AS jsonb), :operation, CAST(:old AS json), CAST(:new AS json),
+                    :contact, :staff, :logical_type, CAST(:logical_id AS jsonb), :soft)',
                 [
                     ':type' => $model::class,
                     ':key' => json_encode($key, JSON_THROW_ON_ERROR),
-                    ':operation' => $operation,
-                    ':old' => $this->document($old),
-                    ':new' => $this->document($new),
+                    ':operation' => $softDelete ? 'delete' : $operation,
+                    ':old' => $oldDocument,
+                    ':new' => $newDocument,
+                    ':contact' => $contactId, ':staff' => $staffId,
+                    ':logical_type' => $logicalType,
+                    ':logical_id' => json_encode($logicalId, JSON_THROW_ON_ERROR),
+                    ':soft' => $softDelete,
                 ]
             )->execute();
         } finally {
@@ -216,6 +270,36 @@ final class AppLogBehavior extends Behavior
             $this->before = [];
             unset(self::$executing[$db]);
         }
+    }
+
+    public function getUpdatedModelClass(): string
+    {
+        $model = $this->record();
+        return method_exists($model, 'getUpdatedModelClass') ? $model->getUpdatedModelClass() : $model::class;
+    }
+
+    /** @return int|string|array<string, int|string> */
+    public function getUpdatedModelId(): int|string|array
+    {
+        $model = $this->record();
+        return method_exists($model, 'getUpdatedModelId') ? $model->getUpdatedModelId() : $model->getPrimaryKey(true);
+    }
+
+    /** @return array{?int, ?int} */
+    private function actorIds(): array
+    {
+        if ($this->actorContactId !== null || $this->actorStaffId !== null) {
+            return [$this->actorContactId > 0 ? $this->actorContactId : null, $this->actorStaffId > 0 ? $this->actorStaffId : null];
+        }
+        $actor = $this->actorProvider === null ? [] : ($this->actorProvider)($this->record());
+        if (!is_array($actor) || array_diff(array_keys($actor), ['contact_id', 'staff_id']) !== []) {
+            throw new \LogicException('actorProvider must return contact_id/staff_id.');
+        }
+        foreach ($actor as $id) {
+            if ($id !== null && !is_int($id)) { throw new \LogicException('Actor IDs must be integers or null.'); }
+        }
+        return [($actor['contact_id'] ?? 0) > 0 ? $actor['contact_id'] : null,
+            ($actor['staff_id'] ?? 0) > 0 ? $actor['staff_id'] : null];
     }
 
     /** @param array<string, mixed> $key
@@ -226,7 +310,8 @@ final class AppLogBehavior extends Behavior
         $model = $this->record();
         $db = $model::getDb();
         $select = ['_exists' => new Expression('1')];
-        foreach ($this->fields as $i => $name) {
+        $fields = array_values(array_unique([...$this->fields, ...($this->deletionMarkAttribute === null ? [] : [$this->deletionMarkAttribute])]));
+        foreach ($fields as $i => $name) {
             $column = $db->quoteColumnName($name);
             $select['t' . $i] = new Expression("pg_typeof($column)::text");
             $select['r' . $i] = new Expression("$column::text");
@@ -239,7 +324,7 @@ final class AppLogBehavior extends Behavior
             throw new \RuntimeException('Audited row was not found; roll back the transaction.');
         }
         $result = [];
-        foreach ($this->fields as $i => $name) {
+        foreach ($fields as $i => $name) {
             $result[$name] = ['type' => (string) $row['t' . $i], 'raw' => $row['r' . $i] === null ? null : (string) $row['r' . $i], 'json' => (string) $row['j' . $i]];
         }
         return $result;
@@ -269,8 +354,9 @@ final class AppLogBehavior extends Behavior
         return $before != $after;
     }
 
-    /** @param Snapshot $snapshot */
-    private function document(array $snapshot): string
+    /** @param Snapshot $snapshot
+     * @param array<string, string> $changes */
+    private function document(array $snapshot, array $changes = []): string
     {
         $entries = [];
         foreach ($snapshot as $field => $value) {
@@ -284,6 +370,7 @@ final class AppLogBehavior extends Behavior
                     $presentation .= ',"display_value":' . json_encode($display, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
                 }
             }
+            if (isset($changes[$field])) { $presentation .= ',"changes":' . $changes[$field]; }
             $entries[] = json_encode($field, JSON_THROW_ON_ERROR) . ':{"db_type":'
                 . json_encode($value['type'], JSON_THROW_ON_ERROR) . ',"data":' . $value['json'] . $presentation . '}';
         }
