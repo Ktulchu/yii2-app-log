@@ -32,9 +32,44 @@ public function behaviors(): array
 }
 ```
 
-Only models with this behavior are audited. `attributes` optionally supplies an inclusion list of column names;
-an empty list means all columns. `except` always wins. Unknown names fail before the business SQL.
-No model callbacks or nested JSON projections are evaluated.
+Only models with this behavior are audited. `attributes` optionally selects columns; an empty array means
+all columns. It accepts a list, per-column options, scalar callbacks, or a mixture. `except` always wins.
+Unknown columns, unsupported options and invalid callbacks fail before the business SQL.
+
+```php
+'attributes' => [
+    'title',
+    'depart_id' => [
+        'label' => 'Подразделение',
+        'value' => function ($id) { return Department::findOne($id)->name ?? null; },
+        'preFilter' => function ($model) { return !$model->getIsArchived(); },
+    ],
+    // Shorthand: 'depart_id' => function ($id) { return Department::findOne($id)->name ?? null; },
+],
+```
+
+`preFilter($model)` runs once per candidate field after the business write and change comparison.
+A falsy result omits that field from both sides of the history entry. It does not cancel the business
+write. If every candidate is filtered out, no history row is inserted. The model is the current owner,
+including its delete-event state. Unchanged and excluded fields do not invoke callbacks.
+
+`value($value)` receives the stored scalar value, converted using Yii's column PHP typecast, for each
+present side: new on INSERT, old/new on UPDATE, old on DELETE. SQL NULL is passed as PHP null.
+Its JSON-serializable result is saved as `display_value`; configured fields also get `label`
+(the configured label or the model's attribute label). These presentation fields sit alongside
+`db_type` and `data`. The original `data.value`, `data.raw` and change detection are unaffected.
+The result is frozen when writing history, so later department renames do not rewrite old entries.
+For example:
+
+```json
+{"depart_id":{"db_type":"integer","data":{"sql_null":false,"value":10,"raw":"10"},"label":"Подразделение","display_value":"Продажи"}}
+```
+
+Callbacks must be read-only, use the existing connection for database lookups, and must not save models,
+alter the owner or manage transactions. Callback exceptions and JSON serialization errors propagate:
+the caller must roll back the business operation, as with an audit SQL error.
+JSON/JSONB support `label` and `preFilter`; `value` callbacks are restricted to scalar columns
+to preserve lossless JSON semantics. Nested JSON projections are unsupported.
 
 ## Transaction contract
 
@@ -188,10 +223,12 @@ locks; applications must handle deadlock/serialization retries by repeating the 
 fresh model instances.
 
 The source mechanism's numeric `attributes` list keeps its name and selection meaning. Default selection
-is deliberately easier: all fields unless excluded. Legacy labels, value callbacks, preFilter,
-element-level JSON only/except/functions, implicit actor IDs, object routing, soft-delete interpretation,
-localized operation strings and model identity callbacks are omitted. Associative legacy attribute
-configuration fails explicitly. Soft delete is a normal UPDATE. There is no implicit user lookup,
+is deliberately easier: all fields unless excluded. Scalar callbacks and label/value/preFilter options
+are supported. Presentation is stored separately from authoritative DB values; old-side SQL NULL is
+passed to callbacks as null rather than replaced with a legacy empty-string sentinel.
+Element-level JSON only/except/functions, implicit actor IDs, object routing, soft-delete interpretation,
+localized operation strings and model identity callbacks are omitted. Unsupported options fail explicitly.
+Soft delete is a normal UPDATE. There is no implicit user lookup,
 retention policy, encryption, historical-data importer or automatic migration of an existing audit table.
 Existing application-specific log tables are not altered.
 

@@ -37,7 +37,7 @@ final class AuditTest extends TestCase
             ]],
         ]);
         $this->db->open();
-        $this->db->createCommand('DROP TABLE IF EXISTS fixture, app_log CASCADE')->execute();
+        $this->db->createCommand('DROP TABLE IF EXISTS fixture, app_log, department CASCADE')->execute();
         $this->db->createCommand('DROP SEQUENCE IF EXISTS write_probe CASCADE')->execute();
         require_once dirname(__DIR__) . '/migrations/m261117_000001_create_app_log.php';
         ob_start();
@@ -379,16 +379,230 @@ final class AuditTest extends TestCase
         self::assertCount(0, $this->rows());
     }
 
-    public function testLegacyCallbackConfigurationFailsBeforeInsert(): void
+    public function testUnsupportedJsonProjectionFailsBeforeInsert(): void
     {
-        Fixture::$configuration = ['attributes' => ['title' => ['label' => 'Title']]];
+        Fixture::$configuration = ['attributes' => ['document' => ['only' => ['nested']]]];
         try {
             $this->atomic(fn () => $this->record()->save(false));
             self::fail('Unsupported legacy options must not be silently ignored.');
         } catch (\LogicException $e) {
-            self::assertStringContainsString('lists', $e->getMessage());
+            self::assertStringContainsString('options', $e->getMessage());
         }
         self::assertCount(0, $this->rows());
+    }
+
+    public function testLabelValueAndPrefilterWithRelatedModelLookup(): void
+    {
+        $this->db->createCommand('CREATE TABLE department (id integer PRIMARY KEY, name text)')->execute();
+        $this->db->createCommand()->batchInsert('department', ['id', 'name'], [[10, 'Sales'], [20, 'Support']])->execute();
+        Fixture::$configuration = ['attributes' => [
+            'amount' => [
+                'label' => 'Подразделение',
+                'value' => function ($id) { return Department::findOne($id)->getAttribute('name') ?? null; },
+                'preFilter' => function ($model) { return !$model->getIsArchived(); },
+            ],
+        ]];
+        $r = $this->record();
+        $r->setAttribute('amount', 10);
+        $this->atomic(fn () => $r->save(false));
+        $entry = json_decode($this->rows()[0]['new_values'], true)['amount'];
+        self::assertSame('Подразделение', $entry['label']);
+        self::assertSame('Sales', $entry['display_value']);
+        self::assertSame(10, $entry['data']['value']);
+        self::assertSame('10', $entry['data']['raw']);
+        $r->setAttribute('amount', 20);
+        $this->atomic(fn () => $r->save(false));
+        self::assertSame('Sales', json_decode($this->rows()[1]['old_values'], true)['amount']['display_value']);
+        self::assertSame('Support', json_decode($this->rows()[1]['new_values'], true)['amount']['display_value']);
+        self::assertSame(10, json_decode($this->rows()[1]['old_values'], true)['amount']['data']['value']);
+        $r->setAttribute('flag', true);
+        $r->setAttribute('amount', 10);
+        $this->atomic(fn () => $r->save(false));
+        self::assertCount(2, $this->rows());
+        self::assertSame(10, (int) $this->db->createCommand('SELECT amount FROM fixture')->queryScalar());
+        $r->setAttribute('flag', false);
+        $this->atomic(fn () => $r->save(false));
+        self::assertCount(2, $this->rows());
+        $this->atomic(fn () => $r->delete());
+        self::assertSame('Sales', json_decode($this->rows()[2]['old_values'], true)['amount']['display_value']);
+        self::assertSame('{}', $this->rows()[2]['new_values']);
+    }
+
+    public function testMixedAttributeListShorthandCallbackAndLabelOnly(): void
+    {
+        $calls = [];
+        Fixture::$configuration = ['attributes' => [
+            'title',
+            'amount' => static function ($value) use (&$calls) { $calls[] = $value; return $value === null ? null : "Value $value"; },
+            'flag' => ['label' => 'Flag'],
+        ]];
+        $r = $this->record();
+        $r->setAttribute('amount', null);
+        $this->atomic(fn () => $r->save(false));
+        $entry = json_decode($this->rows()[0]['new_values'], true);
+        self::assertArrayNotHasKey('label', $entry['title']);
+        self::assertSame('Flag', $entry['flag']['label']);
+        self::assertFalse($entry['flag']['data']['value']);
+        self::assertArrayHasKey('display_value', $entry['amount']);
+        self::assertNull($entry['amount']['display_value']);
+        self::assertSame([null], $calls);
+        $r->setAttribute('amount', 7);
+        $this->atomic(fn () => $r->save(false));
+        self::assertSame([null, null, 7], $calls);
+        self::assertNull(json_decode($this->rows()[1]['old_values'], true)['amount']['display_value']);
+        self::assertSame('Value 7', json_decode($this->rows()[1]['new_values'], true)['amount']['display_value']);
+        $this->atomic(fn () => $r->save(false));
+        self::assertSame([null, null, 7], $calls);
+    }
+
+    #[DataProvider('operations')]
+    public function testCallbackFailurePropagatesAndRollsBack(string $operation): void
+    {
+        $r = $operation === 'insert' ? $this->record() : $this->seed();
+        $before = $this->db->createCommand('SELECT * FROM fixture')->queryAll();
+        $count = count($this->rows());
+        $r->getBehavior('audit')->attributes = ['title' => ['value' => static function () { throw new \RuntimeException('callback failed'); }]];
+        try {
+            $this->atomic(fn () => $this->write($r, $operation));
+            self::fail('Callback errors must propagate.');
+        } catch (\RuntimeException $e) {
+            self::assertSame('callback failed', $e->getMessage());
+        }
+        self::assertSame($before, $this->db->createCommand('SELECT * FROM fixture')->queryAll());
+        self::assertCount($count, $this->rows());
+    }
+
+    public function testPrefilterAndExceptSkipValueCallbacks(): void
+    {
+        $calls = 0;
+        Fixture::$configuration = ['attributes' => [
+            'title' => ['preFilter' => static fn ($model) => false, 'value' => static function () { throw new \RuntimeException('must not run'); }],
+            'amount' => ['value' => static function () { throw new \RuntimeException('excluded must not run'); }],
+            'flag' => ['preFilter' => static function ($model) use (&$calls) { ++$calls; return true; }],
+        ], 'except' => ['amount']];
+        $r = $this->seed();
+        self::assertSame(1, $calls);
+        self::assertSame(['flag'], array_keys(json_decode($this->rows()[0]['new_values'], true)));
+        $r->setAttribute('title', 'second');
+        $this->atomic(fn () => $r->save(false));
+        self::assertSame(1, $calls);
+        self::assertCount(1, $this->rows());
+        $this->atomic(fn () => $r->delete());
+        self::assertSame(2, $calls);
+    }
+
+    public static function invalidOptions(): iterable
+    {
+        yield 'label type' => [['label' => 7]];
+        yield 'value type' => [['value' => 'not_a_real_callback']];
+        yield 'filter type' => [['preFilter' => false]];
+        yield 'unknown option' => [['unknown' => true]];
+    }
+
+    #[DataProvider('invalidOptions')]
+    public function testInvalidCallbackOptionsFailBeforeSql(array $options): void
+    {
+        Fixture::$configuration = ['attributes' => ['title' => $options]];
+        try {
+            $this->atomic(fn () => $this->record()->save(false));
+            self::fail('Invalid options must fail.');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('Audit', $e->getMessage());
+        }
+        self::assertSame(0, (int) $this->db->createCommand('SELECT count(*) FROM fixture')->queryScalar());
+    }
+
+    public function testJsonLabelAndFilterPreserveRawAndRejectValueCallback(): void
+    {
+        Fixture::$configuration = ['attributes' => [
+            'document' => ['label' => 'Document', 'preFilter' => static fn ($model) => true],
+        ]];
+        $r = $this->record();
+        $r->setAttribute('document', RawJson::value('{"n":123456789012345678901234567890}'));
+        $this->atomic(fn () => $r->save(false));
+        $entry = json_decode($this->rows()[0]['new_values'], true, 512, JSON_BIGINT_AS_STRING)['document'];
+        self::assertSame('Document', $entry['label']);
+        self::assertSame('{"n":123456789012345678901234567890}', $entry['data']['raw']);
+        self::assertArrayNotHasKey('display_value', $entry);
+        $r->getBehavior('audit')->attributes = ['document' => ['value' => static fn ($value) => $value]];
+        try {
+            $this->atomic(fn () => $r->save(false));
+            self::fail('JSON value projection must be rejected.');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('scalar', $e->getMessage());
+        }
+        self::assertCount(1, $this->rows());
+    }
+
+    public function testRecursiveWriteFromCallbackRollsBack(): void
+    {
+        Fixture::$configuration = ['attributes' => ['title' => ['value' => function () { $this->record()->save(false); }]]];
+        try {
+            $this->atomic(fn () => $this->record()->save(false));
+            self::fail('Recursive callback writes must fail.');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('Recursive', $e->getMessage());
+        }
+        self::assertCount(0, $this->rows());
+        self::assertSame(0, (int) $this->db->createCommand('SELECT count(*) FROM fixture')->queryScalar());
+    }
+
+    #[DataProvider('operations')]
+    public function testPrefilterFailurePropagatesAndRollsBack(string $operation): void
+    {
+        $r = $operation === 'insert' ? $this->record() : $this->seed();
+        $before = $this->db->createCommand('SELECT * FROM fixture')->queryAll();
+        $count = count($this->rows());
+        $r->getBehavior('audit')->attributes = ['title' => ['preFilter' => static function () { throw new \RuntimeException('filter failed'); }]];
+        try {
+            $this->atomic(fn () => $this->write($r, $operation));
+            self::fail('Filter errors must propagate.');
+        } catch (\RuntimeException $e) {
+            self::assertSame('filter failed', $e->getMessage());
+        }
+        self::assertSame($before, $this->db->createCommand('SELECT * FROM fixture')->queryAll());
+        self::assertCount($count, $this->rows());
+    }
+
+    #[DataProvider('operations')]
+    public function testAllFilteredFieldsDoNotCreateHistory(string $operation): void
+    {
+        $r = $operation === 'insert' ? $this->record() : $this->seed();
+        $count = count($this->rows());
+        $r->getBehavior('audit')->attributes = ['title' => ['preFilter' => static fn ($model) => false]];
+        $this->atomic(fn () => $this->write($r, $operation));
+        self::assertCount($count, $this->rows());
+        if ($operation === 'delete') {
+            self::assertSame(0, (int) $this->db->createCommand('SELECT count(*) FROM fixture')->queryScalar());
+        } else {
+            self::assertSame('changed', $this->db->createCommand('SELECT title FROM fixture')->queryScalar());
+        }
+    }
+
+    public function testCallbackOutputDoesNotControlChangeDetection(): void
+    {
+        Fixture::$configuration = ['attributes' => ['title' => static fn ($value) => 'same display']];
+        $r = $this->seed();
+        $r->setAttribute('title', 'second');
+        $this->atomic(fn () => $r->save(false));
+        self::assertCount(2, $this->rows());
+        self::assertSame('first', json_decode($this->rows()[1]['old_values'], true)['title']['data']['value']);
+        self::assertSame('second', json_decode($this->rows()[1]['new_values'], true)['title']['data']['value']);
+        self::assertSame('same display', json_decode($this->rows()[1]['old_values'], true)['title']['display_value']);
+        self::assertSame('same display', json_decode($this->rows()[1]['new_values'], true)['title']['display_value']);
+    }
+
+    public function testUnserializableCallbackResultRollsBack(): void
+    {
+        Fixture::$configuration = ['attributes' => ['title' => static fn ($value) => NAN]];
+        try {
+            $this->atomic(fn () => $this->record()->save(false));
+            self::fail('Unserializable callback output must fail.');
+        } catch (\JsonException $e) {
+            self::assertSame(JSON_ERROR_INF_OR_NAN, $e->getCode());
+        }
+        self::assertCount(0, $this->rows());
+        self::assertSame(0, (int) $this->db->createCommand('SELECT count(*) FROM fixture')->queryScalar());
     }
 
     public function testLargeJsonbNumbersCompareInPostgresWithoutFloatRounding(): void
@@ -457,6 +671,13 @@ class Fixture extends ActiveRecord
     {
         return self::$transactional ? [$this->getScenario() => self::OP_ALL] : [];
     }
+    public function getIsArchived(): bool { return (bool) $this->getAttribute('flag'); }
+}
+
+final class Department extends Fixture
+{
+    public static function tableName(): string { return 'department'; }
+    public function behaviors(): array { return []; }
 }
 
 final class AuditFixture extends Fixture

@@ -17,8 +17,8 @@ use yii\db\Transaction;
  */
 final class AppLogBehavior extends Behavior
 {
-    /** Included column names; empty means all columns. Legacy callback/projection syntax is deliberately rejected.
-     * @var list<string>
+    /** Column names, scalar callbacks, or label/value/preFilter options. Empty means all columns.
+     * @var array<int|string, string|callable|array{label?: string, value?: callable, preFilter?: callable}>
      */
     public array $attributes = [];
     /** @var list<string> */
@@ -27,6 +27,8 @@ final class AppLogBehavior extends Behavior
     private array $before = [];
     /** @var list<string> */
     private array $fields = [];
+    /** @var array<string, array{label?: string, value?: callable, preFilter?: callable}> */
+    private array $fieldOptions = [];
     private ?Connection $connection = null;
     private ?Transaction $transaction = null;
     private ?\PDO $pdo = null;
@@ -108,17 +110,38 @@ final class AppLogBehavior extends Behavior
             if ($schema->primaryKey === []) {
                 throw new \LogicException('Audited models require a primary key.');
             }
-            foreach ([$this->attributes, $this->except] as $names) {
-                if (!array_is_list($names)) {
-                    throw new \LogicException('attributes and except accept lists of column names only.');
-                }
-                foreach ($names as $name) {
-                    if (!is_string($name) || !isset($schema->columns[$name])) {
-                        throw new \LogicException('Unknown audit column or unsupported legacy attribute configuration.');
-                    }
+            if (!array_is_list($this->except)) {
+                throw new \LogicException('except accepts a list of column names only.');
+            }
+            foreach ($this->except as $name) {
+                if (!is_string($name) || !isset($schema->columns[$name])) {
+                    throw new \LogicException('Unknown excluded audit column.');
                 }
             }
-            $this->fields = array_values(array_diff($this->attributes ?: array_keys($schema->columns), $this->except));
+            $this->fieldOptions = [];
+            foreach ($this->attributes ?: array_keys($schema->columns) as $key => $configuration) {
+                $name = is_int($key) ? $configuration : $key;
+                if (!is_string($name) || !isset($schema->columns[$name])) {
+                    throw new \LogicException('Unknown audit column.');
+                }
+                $options = is_int($key) ? [] : (is_callable($configuration) ? ['value' => $configuration] : $configuration);
+                if (!is_array($options) || array_diff(array_keys($options), ['label', 'value', 'preFilter']) !== []) {
+                    throw new \LogicException('Audit options accept only label, value and preFilter.');
+                }
+                if (array_key_exists('label', $options) && !is_string($options['label'])) {
+                    throw new \LogicException('Audit label must be a string.');
+                }
+                foreach (['value', 'preFilter'] as $callback) {
+                    if (array_key_exists($callback, $options) && !is_callable($options[$callback])) {
+                        throw new \LogicException('Audit ' . $callback . ' must be callable.');
+                    }
+                }
+                if (isset($options['value']) && in_array($schema->columns[$name]->dbType, ['json', 'jsonb'], true)) {
+                    throw new \LogicException('Value callbacks support scalar columns only; JSON is audited losslessly.');
+                }
+                $this->fieldOptions[$name] = $options;
+            }
+            $this->fields = array_values(array_diff(array_keys($this->fieldOptions), $this->except));
             $this->connection = $db;
             $this->transaction = $transaction;
             $this->pdo = $db->getMasterPdo();
@@ -166,6 +189,15 @@ final class AppLogBehavior extends Behavior
                 }
             }
             if ($this->fields === []) {
+                return;
+            }
+            foreach (array_keys($old + $new) as $name) {
+                $filter = $this->fieldOptions[$name]['preFilter'] ?? null;
+                if ($filter !== null && !$filter($model)) {
+                    unset($old[$name], $new[$name]);
+                }
+            }
+            if ($old === [] && $new === []) {
                 return;
             }
             $db->createCommand(
@@ -242,8 +274,18 @@ final class AppLogBehavior extends Behavior
     {
         $entries = [];
         foreach ($snapshot as $field => $value) {
+            $options = $this->fieldOptions[$field];
+            $presentation = '';
+            if ($options !== []) {
+                $presentation = ',"label":' . json_encode($options['label'] ?? $this->record()->getAttributeLabel($field), JSON_THROW_ON_ERROR);
+                if (isset($options['value'])) {
+                    $column = $this->record()::getTableSchema()->columns[$field];
+                    $display = $options['value']($column->phpTypecast($value['raw']));
+                    $presentation .= ',"display_value":' . json_encode($display, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+                }
+            }
             $entries[] = json_encode($field, JSON_THROW_ON_ERROR) . ':{"db_type":'
-                . json_encode($value['type'], JSON_THROW_ON_ERROR) . ',"data":' . $value['json'] . '}';
+                . json_encode($value['type'], JSON_THROW_ON_ERROR) . ',"data":' . $value['json'] . $presentation . '}';
         }
         return '{' . implode(',', $entries) . '}';
     }
