@@ -10,6 +10,7 @@ final class m261117_000002_create_note extends Migration
             'title' => $this->text(),
             'document' => 'json',
             'settings' => 'jsonb',
+            'is_deleted' => $this->boolean()->notNull()->defaultValue(false),
         ]);
     }
     public function safeDown(): void { $this->dropTable('note'); }

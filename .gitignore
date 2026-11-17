@@ -5,3 +5,4 @@
 /fixtures/basic/composer.lock
 /fixtures/basic/runtime/
 /.phpstan/
+/.test-artifacts/
