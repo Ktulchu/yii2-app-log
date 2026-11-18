@@ -174,6 +174,27 @@ The provider runs once for a history row and never for a no-op. Its exceptions p
 Providers work identically in Web, REST, CLI and jobs; any session lookup must be written explicitly
 by the application. Both roles are persisted separately on INSERT/UPDATE/DELETE.
 
+### Source of automatic changes
+
+The nullable `source_type` column records **where** the write originated, separately from
+`contact_id` and `staff_id`; no system-user account is required.
+Console writes use `console:<requestedRoute>` automatically (e.g. `console:orders/sync`);
+without a requested route, the fallback is `console`.
+Web/REST writes without an explicit source remain `NULL`.
+
+For a queue handler, set the source on **each affected model** to identify the actual job
+instead of just the console route (e.g. `console:queue/listen`):
+
+```php
+$model->getBehavior('audit')->sourceType = 'queue:ReconcilePaymentJob';
+```
+
+You can also set `sourceType` in `behaviors()`. Explicit values override the console default;
+they must contain 1..255 bytes. `NULL` selects automatic detection. The value is persisted on
+INSERT/UPDATE/DELETE (including soft delete), but no-op writes produce no history.
+Apply additive migration `m261118_000004_add_app_log_source_type` before using this version;
+existing rows retain `NULL` in the new column.
+
 `deletionMarkAttribute` observes an actual stored change even if the marker is outside the audit field list.
 For compatibility, default `deletionMarkValue = null` means **any actual marker change**, including restoring
 it, is classified as `operation = delete`, `is_soft_delete = true`. This is the source's ambiguous rule.
@@ -286,7 +307,8 @@ The `{{%app_log}}` table respects Yii's table prefix:
 `operation text` (insert/update/delete), `occurred_at timestamptz`, `old_values json`, `new_values json`.
 An additive migration adds nullable `contact_id/staff_id bigint`,
 `logical_entity_type text/logical_entity_id jsonb`, `is_soft_delete boolean DEFAULT false`,
-and a logical-identity history index. Existing columns and old records are preserved.
+and a logical-identity history index. A separate additive migration adds nullable
+`source_type varchar(255)`. Existing columns and old records are preserved.
 Indexes cover entity type/key/id and time. Composite, string, UUID and integer primary keys work;
 changing a primary key records the new key for that update. Earlier history stays under the earlier key.
 The timestamp is the audit insertion time, not the outer transaction's commit time.
