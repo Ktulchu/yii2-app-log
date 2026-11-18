@@ -41,10 +41,12 @@ final class AuditTest extends TestCase
         $this->db->createCommand('DROP SEQUENCE IF EXISTS write_probe CASCADE')->execute();
         require_once dirname(__DIR__) . '/migrations/m261117_000001_create_app_log.php';
         require_once dirname(__DIR__) . '/migrations/m261117_000003_add_app_log_context.php';
+        require_once dirname(__DIR__) . '/migrations/m261118_000004_add_app_log_source_type.php';
         ob_start();
         try {
             self::assertNotFalse((new \m261117_000001_create_app_log(['db' => $this->db]))->up());
             self::assertNotFalse((new \m261117_000003_add_app_log_context(['db' => $this->db]))->up());
+            self::assertNotFalse((new \m261118_000004_add_app_log_source_type(['db' => $this->db]))->up());
         } finally {
             ob_end_clean();
         }

@@ -34,10 +34,12 @@ final class ParityTest extends TestCase
         $this->db->createCommand('DROP TABLE IF EXISTS parity_fixture, app_log CASCADE')->execute();
         require_once dirname(__DIR__) . '/migrations/m261117_000001_create_app_log.php';
         require_once dirname(__DIR__) . '/migrations/m261117_000003_add_app_log_context.php';
+        require_once dirname(__DIR__) . '/migrations/m261118_000004_add_app_log_source_type.php';
         ob_start();
         try {
             self::assertNotFalse((new \m261117_000001_create_app_log(['db' => $this->db]))->up());
             self::assertNotFalse((new \m261117_000003_add_app_log_context(['db' => $this->db]))->up());
+            self::assertNotFalse((new \m261118_000004_add_app_log_source_type(['db' => $this->db]))->up());
         } finally { ob_end_clean(); }
         $this->db->createCommand('CREATE TABLE parity_fixture (
             id serial PRIMARY KEY, title text, document json, binary_document jsonb,
@@ -350,6 +352,78 @@ final class ParityTest extends TestCase
         $this->atomic(fn () => $model->delete());
         self::assertSame(23, $this->rows()[2]['contact_id']);
         self::assertSame(1, $calls);
+    }
+
+    public function testSourceTypeConsoleQueueAndNoop(): void
+    {
+        ParityRecord::$config = ['actorStaffId' => 42];
+        $previousRoute = \Yii::$app->requestedRoute;
+        \Yii::$app->requestedRoute = 'payments/reconcile';
+        try {
+            $model = $this->record();
+            $this->atomic(fn () => $model->save(false));
+            $model->getBehavior('audit')->sourceType = 'queue:PaymentReconcileJob';
+            $model->setAttribute('title', 'Second');
+            $this->atomic(fn () => $model->save(false));
+            $model->getBehavior('audit')->sourceType = null;
+            $model->setAttribute('title', 'Third');
+            $this->atomic(fn () => $model->save(false));
+            $this->atomic(fn () => $model->save(false)); // No-op creates no row.
+            $this->atomic(fn () => $model->delete());
+
+            $expected = ['console:payments/reconcile', 'queue:PaymentReconcileJob',
+                'console:payments/reconcile', 'console:payments/reconcile'];
+            self::assertSame($expected, array_column($this->rows(), 'source_type'));
+            self::assertSame([42, 42, 42, 42], array_column($this->rows(), 'staff_id'));
+            self::assertSame($expected, array_column(
+                History::read($this->db, ParityRecord::class, ['id' => $model->getAttribute('id')]),
+                'source_type'
+            ));
+        } finally {
+            \Yii::$app->requestedRoute = $previousRoute;
+        }
+    }
+
+    public function testSourceTypeWithoutRouteAndInvalidValues(): void
+    {
+        $previousRoute = \Yii::$app->requestedRoute;
+        \Yii::$app->requestedRoute = null;
+        try {
+            $model = $this->record();
+            $this->atomic(fn () => $model->save(false));
+            self::assertSame('console', $this->rows()[0]['source_type']);
+
+            foreach (['', str_repeat('x', 256)] as $invalid) {
+                $another = $this->record();
+                $another->getBehavior('audit')->sourceType = $invalid;
+                try {
+                    $this->atomic(fn () => $another->save(false));
+                    self::fail('Invalid sourceType must fail before writing.');
+                } catch (\LogicException $error) {
+                    self::assertStringContainsString('sourceType', $error->getMessage());
+                }
+            }
+            self::assertCount(1, $this->rows());
+            self::assertSame(1, (int) $this->db->createCommand('SELECT count(*) FROM parity_fixture')->queryScalar());
+        } finally {
+            \Yii::$app->requestedRoute = $previousRoute;
+        }
+    }
+
+    public function testSourceTypeMigrationPreservesOldHistory(): void
+    {
+        ob_start();
+        try {
+            self::assertNotFalse((new \m261118_000004_add_app_log_source_type(['db' => $this->db]))->down());
+            $this->db->createCommand("INSERT INTO app_log (entity_type,entity_id,operation,old_values,new_values)
+                VALUES ('Old','{\"id\":1}','insert','{}','{}')")->execute();
+            self::assertNotFalse((new \m261118_000004_add_app_log_source_type(['db' => $this->db]))->up());
+        } finally {
+            ob_end_clean();
+        }
+        $rows = History::read($this->db, 'Old', ['id' => 1]);
+        self::assertCount(1, $rows);
+        self::assertNull($rows[0]['source_type']);
     }
 
     public function testSoftDeleteLegacyAndTargetedRestoration(): void
