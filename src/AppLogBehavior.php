@@ -26,6 +26,8 @@ final class AppLogBehavior extends Behavior
     public array $except = [];
     public ?int $actorContactId = null;
     public ?int $actorStaffId = null;
+    /** Origin of the write, e.g. console:orders/sync or queue:PaymentJob. */
+    public ?string $sourceType = null;
     /** @var callable(ActiveRecord): array{contact_id?: ?int, staff_id?: ?int}|null */
     public $actorProvider = null;
     public ?string $deletionMarkAttribute = null;
@@ -44,6 +46,7 @@ final class AppLogBehavior extends Behavior
     /** @var array<string, mixed> */
     private array $key = [];
     private ?string $operation = null;
+    private ?string $resolvedSourceType = null;
     /** @var \WeakMap<Connection, bool>|null */
     private static ?\WeakMap $executing = null;
 
@@ -91,6 +94,7 @@ final class AppLogBehavior extends Behavior
         try {
             $this->operation = null;
             $this->before = [];
+            $this->resolvedSourceType = null;
             if ($db->driverName !== 'pgsql' || $db->slaves !== [] || $db->masters !== []) {
                 throw new \LogicException('Use one PostgreSQL Connection without replicas or master pools.');
             }
@@ -120,6 +124,15 @@ final class AppLogBehavior extends Behavior
             }
             if ($this->actorProvider !== null && !is_callable($this->actorProvider)) {
                 throw new \LogicException('actorProvider must be callable.');
+            }
+            $this->resolvedSourceType = $this->sourceType;
+            if ($this->resolvedSourceType === null && \Yii::$app instanceof \yii\console\Application) {
+                $route = \Yii::$app->requestedRoute;
+                $this->resolvedSourceType = is_string($route) && $route !== '' ? 'console:' . $route : 'console';
+            }
+            if ($this->resolvedSourceType !== null
+                && ($this->resolvedSourceType === '' || strlen($this->resolvedSourceType) > 255)) {
+                throw new \LogicException('sourceType must contain 1..255 bytes.');
             }
             if ($this->deletionMarkAttribute !== null
                 && (!isset($schema->columns[$this->deletionMarkAttribute])
@@ -250,9 +263,9 @@ final class AppLogBehavior extends Behavior
             }
             $db->createCommand(
                 'INSERT INTO {{%app_log}} (entity_type, entity_id, operation, old_values, new_values,
-                    contact_id, staff_id, logical_entity_type, logical_entity_id, is_soft_delete)
+                    contact_id, staff_id, logical_entity_type, logical_entity_id, is_soft_delete, source_type)
                  VALUES (:type, CAST(:key AS jsonb), :operation, CAST(:old AS json), CAST(:new AS json),
-                    :contact, :staff, :logical_type, CAST(:logical_id AS jsonb), :soft)',
+                    :contact, :staff, :logical_type, CAST(:logical_id AS jsonb), :soft, :source_type)',
                 [
                     ':type' => $model::class,
                     ':key' => json_encode($key, JSON_THROW_ON_ERROR),
@@ -262,12 +275,13 @@ final class AppLogBehavior extends Behavior
                     ':contact' => $contactId, ':staff' => $staffId,
                     ':logical_type' => $logicalType,
                     ':logical_id' => json_encode($logicalId, JSON_THROW_ON_ERROR),
-                    ':soft' => $softDelete,
+                    ':soft' => $softDelete, ':source_type' => $this->resolvedSourceType,
                 ]
             )->execute();
         } finally {
             $this->operation = null;
             $this->before = [];
+            $this->resolvedSourceType = null;
             unset(self::$executing[$db]);
         }
     }

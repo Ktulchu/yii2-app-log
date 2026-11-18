@@ -9,13 +9,12 @@ The underlying audit behavior was developed and used in a private commercial Yii
 ## Install
 
 The package is distributed through GitHub VCS; it is not published on Packagist.
-This document includes changes under review on `codex/restore-behavior-parity`.
-They are not part of the existing v0.1.0 tag. For review install
-`ktulchu/yii2-app-log:dev-codex/restore-behavior-parity` through the same VCS repository.
+**v0.3.0** adds nullable `source_type` for CLI/queue provenance.
+Run all outstanding migrations **before enabling the upgraded behavior**.
 
 ```sh
 composer config repositories.yii2-app-log vcs https://github.com/Ktulchu/yii2-app-log
-composer require ktulchu/yii2-app-log:^0.1
+composer require ktulchu/yii2-app-log:^0.3
 php yii migrate --migrationPath=@vendor/ktulchu/yii2-app-log/migrations --interactive=0
 ```
 
@@ -174,6 +173,43 @@ The provider runs once for a history row and never for a no-op. Its exceptions p
 Providers work identically in Web, REST, CLI and jobs; any session lookup must be written explicitly
 by the application. Both roles are persisted separately on INSERT/UPDATE/DELETE.
 
+### Source of automatic changes
+
+The nullable `source_type` column records **where** the write originated, separately from
+`contact_id` and `staff_id`; no system-user account is required.
+Console writes use `console:<requestedRoute>` automatically (e.g. `console:orders/sync`);
+without a requested route, the fallback is `console`.
+Web/REST writes without an explicit source remain `NULL`.
+
+For a queue handler, set the source on **each affected model** to identify the actual job
+instead of just the console route (e.g. `console:queue/listen`):
+
+```php
+// In ReconcilePaymentJob::execute(), before save() / delete():
+$model->getBehavior('audit')->sourceType = 'queue:ReconcilePaymentJob';
+// Run the audited write inside the required application-owned transaction.
+```
+
+Or configure a fixed source on a model's behavior:
+
+```php
+public function behaviors(): array
+{
+    return [
+        'audit' => [
+            'class' => \Ktulchu\Yii2AppLog\AppLogBehavior::class,
+            'sourceType' => 'console:import/legacy-records',
+        ],
+    ];
+}
+```
+
+You can also set `sourceType` in `behaviors()`. Explicit values override the console default;
+they must contain 1..255 bytes. `NULL` selects automatic detection. The value is persisted on
+INSERT/UPDATE/DELETE (including soft delete), but no-op writes produce no history.
+Apply additive migration `m261118_000004_add_app_log_source_type` before using this version;
+existing rows retain `NULL` in the new column.
+
 `deletionMarkAttribute` observes an actual stored change even if the marker is outside the audit field list.
 For compatibility, default `deletionMarkValue = null` means **any actual marker change**, including restoring
 it, is classified as `operation = delete`, `is_soft_delete = true`. This is the source's ambiguous rule.
@@ -286,7 +322,8 @@ The `{{%app_log}}` table respects Yii's table prefix:
 `operation text` (insert/update/delete), `occurred_at timestamptz`, `old_values json`, `new_values json`.
 An additive migration adds nullable `contact_id/staff_id bigint`,
 `logical_entity_type text/logical_entity_id jsonb`, `is_soft_delete boolean DEFAULT false`,
-and a logical-identity history index. Existing columns and old records are preserved.
+and a logical-identity history index. A separate additive migration adds nullable
+`source_type varchar(255)`. Existing columns and old records are preserved.
 Indexes cover entity type/key/id and time. Composite, string, UUID and integer primary keys work;
 changing a primary key records the new key for that update. Earlier history stays under the earlier key.
 The timestamp is the audit insertion time, not the outer transaction's commit time.
@@ -362,9 +399,11 @@ are supported as described above. Unsupported options fail explicitly. There is 
 retention policy, encryption, historical-data importer or automatic migration of an existing audit table.
 Existing application-specific log tables are not altered.
 
-When upgrading this package, run the same migration command to apply
-`m261117_000003_add_app_log_context` before enabling the new behavior version. No existing migration
-or v0.1.0 tag is rewritten. When migrating from the source application, replace behavior/helper namespaces,
+When upgrading, run the same migration command to apply
+`m261117_000003_add_app_log_context` (if not already applied) and
+`m261118_000004_add_app_log_source_type` **before enabling v0.3.0**, which writes
+the new column. Existing history retains `NULL` as its unknown source.
+No existing migration or earlier release tag is rewritten. When migrating from the source application, replace behavior/helper namespaces,
 move application actor rules into a provider or explicit IDs, and keep related label/callback models
 in the application. Add the required outer transaction to every audited write.
 No old application log table or data is migrated automatically.
